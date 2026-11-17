@@ -100,11 +100,32 @@ def aligned_value(values: dict[int, float], hour: int, shift: int = 0,
     return values.get(hour - shift, default)
 
 
-def _timestamp_hour(value: str, day_start: datetime) -> int | None:
+def fast_hour(value, day_text: str) -> int | None:
+    """Release-day hour from fixed-width ISO UTC, with a safe general fallback."""
+    if isinstance(value, str) and len(value) >= 13 and value[:10] == day_text:
+        try:
+            hour = int(value[11:13])
+        except ValueError:
+            return None
+        return hour + 1 if 0 <= hour < 24 else None
+    if not isinstance(value, str) or value[:10] != day_text:
+        return None
     dt = parse_time(value)
     if dt is None:
         return None
-    return int((dt - day_start).total_seconds() // 3600) + 1
+    return dt.hour + 1 if dt.date().isoformat() == day_text else None
+
+
+_ORDINAL_CACHE = {}
+
+
+def _iso_ordinal(value):
+    key = value[:10]
+    ordinal = _ORDINAL_CACHE.get(key)
+    if ordinal is None:
+        ordinal = datetime(int(key[0:4]), int(key[5:7]), int(key[8:10])).toordinal()
+        _ORDINAL_CACHE[key] = ordinal
+    return ordinal
 
 
 def _mean(values) -> float:
@@ -134,8 +155,10 @@ def _platform_flags(platforms: str, unlock: str) -> tuple[int, int, int]:
 
 
 def regime_probabilities(platforms: str, unlock: str, early_activity: float,
-                         history_ratio: float = 0.0) -> list[float]:
-    """Soft regime membership; metadata and observations both contribute."""
+                         history_ratio: float = 0.0, h1: float = 0.0,
+                         eu_ratio: float = 0.0, nz_ratio: float = 0.0,
+                         minute_reads: int = 0) -> list[float]:
+    """Soft regime membership; observations override ambiguous provenance notes."""
     text = (unlock or "").lower()
     has_pc, console_only, global_late = _platform_flags(platforms, unlock)
     positive_text = text.replace("no early access", "").replace("no early-access", "")
@@ -148,9 +171,22 @@ def regime_probabilities(platforms: str, unlock: str, early_activity: float,
     surge = (0.50 if utc_surge else 0.06 if has_pc else 0.015) * (1.0 - early)
     late = (0.74 if global_late else 0.055 if has_pc else 0.018) * (1.0 - early)
     probs = [rolling_console, rolling_multi, surge, early, late]
-    # Sustained activity long before release is evidence independent of notes.
-    pre_signal = clamp(history_ratio / 0.8, 0.0, 0.35)
-    probs[3] += pre_signal
+    # A tiny, quiet checkpoint followed by a global unlock is identifiable from
+    # observations even when notes contain only data provenance.
+    low_h1 = clamp((math.log(20000.0) - math.log(max(1.0, h1))) / 3.0, 0.0, 1.0)
+    quiet_regions = clamp(1.0 - max(eu_ratio, nz_ratio) / 1.8, 0.25, 1.0)
+    observed_late = low_h1 * quiet_regions * (1.0 - 0.35 * early_activity)
+    live_at_h1 = clamp((math.log(max(1.0, h1)) - math.log(12000.0)) / 1.8, 0.0, 1.0)
+    if h1 >= 20000:
+        live_at_h1 = max(live_at_h1, clamp(max(eu_ratio, nz_ratio) / 0.6, 0.0, 1.0))
+    if minute_reads >= 20:
+        live_at_h1 = 1.0
+    observed_late *= 1.0 - live_at_h1
+    probs[4] = max(probs[4], 5.5 * observed_late)
+    if live_at_h1 > 0.5:
+        probs[4] *= 1.0 - 0.96 * live_at_h1
+    probs[3] *= 1.0 - 0.88 * observed_late
+    probs[3] += clamp(history_ratio / 0.8, 0.0, 0.35) * (1.0 - live_at_h1) * (1.0 - observed_late)
     total = sum(probs)
     return [p / total for p in probs]
 
@@ -167,17 +203,27 @@ def extract_features(case: dict) -> dict[str, float | int | list[float] | str]:
     hourly = case.get("history_hourly") or []
     pre_values, pre_eu, pre_nz, minute_values = [], [], [], []
     last_hour_points = []
+    checkpoint_ordinal = checkpoint.date().toordinal()
+    checkpoint_seconds = checkpoint_ordinal * 86400 + checkpoint.hour * 3600 + checkpoint.minute * 60
     for row in history:
         if not isinstance(row, dict):
             continue
-        at = parse_time(row.get("at") or row.get("from"))
-        if at is None or at >= checkpoint:
+        stamp = row.get("at") or row.get("from")
+        try:
+            seconds = _iso_ordinal(stamp) * 86400 + int(stamp[11:13]) * 3600 + int(stamp[14:16]) * 60
+            elapsed = (checkpoint_seconds - seconds) / 3600.0
+            utc_hour = int(stamp[11:13])
+        except (TypeError, ValueError, IndexError):
+            at = parse_time(stamp)
+            if at is None:
+                continue
+            elapsed = (checkpoint - at).total_seconds() / 3600.0
+            utc_hour = at.hour
+        if elapsed <= 0:
             continue
         value = max(0.0, finite(row.get("viewers"), 0.0))
-        elapsed = (checkpoint - at).total_seconds() / 3600.0
         if elapsed > 0:
             pre_values.append(value)
-            utc_hour = at.hour
             if 15 <= utc_hour <= 20:
                 pre_eu.append(value)
             if 11 <= utc_hour <= 13:
@@ -193,17 +239,25 @@ def extract_features(case: dict) -> dict[str, float | int | list[float] | str]:
     if live:
         minute_values = last_hour_points[-60:]
     recent_hourly = []
+    day_ordinal = day.date().toordinal() * 86400
     for row in hourly:
         if not isinstance(row, dict):
             continue
-        at = parse_time(row.get("from"))
-        if at is not None and day - timedelta(hours=4) <= at < checkpoint:
-            recent_hourly.append((at, max(1.0, finite(row.get("viewers"), 1.0))))
+        stamp = row.get("from")
+        try:
+            seconds = _iso_ordinal(stamp) * 86400 + int(stamp[11:13]) * 3600 + int(stamp[14:16]) * 60
+        except (TypeError, ValueError, IndexError):
+            at = parse_time(stamp)
+            if at is None:
+                continue
+            seconds = int(at.timestamp())
+        if day_ordinal - 4 * 86400 <= seconds < checkpoint_seconds:
+            recent_hourly.append((seconds, max(1.0, finite(row.get("viewers"), 1.0))))
     recent_hourly.sort(key=lambda pair: pair[0])
     logs = [math.log(v) for _, v in recent_hourly[-4:]]
     slope_1h = logs[-1] - logs[-2] if len(logs) >= 2 else 0.0
     slope_2h = (logs[-1] - logs[-3]) / 2.0 if len(logs) >= 3 else slope_1h
-    pre_recent = [v for at, v in recent_hourly if at < day]
+    pre_recent = [v for at, v in recent_hourly if at < day_ordinal]
     sustained = 0.0
     if pre_recent and h1 > 1:
         sustained = clamp(_mean(pre_recent[-6:]) / h1, 0.0, 2.0)
@@ -217,7 +271,15 @@ def extract_features(case: dict) -> dict[str, float | int | list[float] | str]:
         unlock_text = "Rolling midnight local; console only; no early access"
     early_activity = clamp((sustained - 0.16) * 2.2, 0.0, 0.85)
     prelaunch_ratio = 0.0 if live else (_mean(pre_values[-12:]) / h1 if pre_values else 0.0)
-    probs = regime_probabilities(platforms, unlock_text, early_activity, prelaunch_ratio)
+    eu_ratio = clamp(_mean(pre_eu) / h1 if pre_eu else 0.0, 0.0, 3.0)
+    nz_ratio = clamp(_mean(pre_nz) / h1 if pre_nz else 0.0, 0.0, 3.0)
+    probs = regime_probabilities(platforms, unlock_text, early_activity, prelaunch_ratio,
+                                 h1, eu_ratio, nz_ratio, len(last_hour_points))
+    live_at_h1 = clamp((math.log(h1) - math.log(12000.0)) / 1.8, 0.0, 1.0)
+    if h1 >= 20000:
+        live_at_h1 = max(live_at_h1, clamp(max(eu_ratio, nz_ratio) / 0.6, 0.0, 1.0))
+    if live:
+        live_at_h1 = 1.0
     if live and minute_values:
         logs_minute = [math.log(max(1.0, v)) for v in minute_values]
         minute_slope = _slope(logs_minute[-20:]) * 60.0
@@ -238,8 +300,8 @@ def extract_features(case: dict) -> dict[str, float | int | list[float] | str]:
     return {
         "h1": h1, "log_h1": math.log(h1), "channels": channels,
         "vpc": math.log1p(h1 / max(1.0, channels)),
-        "eu_ratio": clamp(_mean(pre_eu) / h1 if pre_eu else 0.0, 0.0, 3.0),
-        "nz_ratio": clamp(_mean(pre_nz) / h1 if pre_nz else 0.0, 0.0, 3.0),
+        "eu_ratio": eu_ratio,
+        "nz_ratio": nz_ratio,
         "slope_1h": clamp(slope_1h, -3.0, 3.0),
         "slope_2h": clamp(slope_2h, -3.0, 3.0),
         "sustained": sustained, "early_activity": early_activity,
@@ -248,7 +310,9 @@ def extract_features(case: dict) -> dict[str, float | int | list[float] | str]:
         "minute_cv": clamp(cv, 0.0, 3.0), "minute_reads": read_count,
         "concentration": clamp(concentration, 0.0, 1.0),
         "console_only": console_only, "regimes": probs,
+        "live_at_h1": live_at_h1, "late_global_observed": probs[4],
         "weekday": day.weekday(), "us_dst": int(us_dst(day)),
+        "us_unlock_utc": 4 if us_dst(day) else 5,
         "eu_dst": int(eu_dst(day)), "day_start": day.isoformat(),
     }
 
@@ -276,23 +340,36 @@ def structural_log_ratios(features: dict) -> list[float]:
     probs = list(features.get("regimes") or [0.2] * 5)
     h1 = max(1.0, finite(features.get("h1"), 1.0))
     scale = math.tanh((math.log(h1) - 10.5) / 2.7)
-    # Curves describe broad release mechanics, not individual launch identities.
-    console = (-0.06, 0.04, 0.30, 0.85, 1.35, 1.62, 1.60, 1.40,
-               1.15, 0.90, 0.68, 0.55, 0.76, 0.96, 1.06, 1.02,
-               0.90, 0.68, 0.47, 0.30, 0.17, 0.02, -0.12)
-    multi = (0.06, 0.18, 0.40, 0.72, 1.05, 1.28, 1.34, 1.27,
-             1.10, 0.88, 0.66, 0.49, 0.62, 0.81, 0.90, 0.86,
-             0.74, 0.54, 0.32, 0.14, 0.02, -0.08, -0.17)
-    surge = (0.65, 0.46, 0.36, 0.55, 0.88, 1.18, 1.35, 1.30,
-             1.10, 0.87, 0.64, 0.48, 0.55, 0.71, 0.77, 0.72,
-             0.58, 0.41, 0.22, 0.06, -0.06, -0.15, -0.23)
-    early = (-0.34, -0.29, -0.17, 0.02, 0.22, 0.40, 0.48, 0.44,
-             0.32, 0.19, 0.08, 0.02, 0.10, 0.21, 0.25, 0.22,
-             0.13, 0.01, -0.10, -0.19, -0.27, -0.35, -0.42)
-    late = (-0.45, -0.38, -0.25, -0.08, 0.13, 0.34, 0.55, 0.79,
-            1.02, 1.27, 1.45, 1.54, 1.52, 1.42, 1.25, 1.06,
-            0.82, 0.59, 0.35, 0.15, 0.00, -0.12, -0.23)
+    # UTC-hour curves: the console reference is EST, so Hour 6 is the US East
+    # rebound. Prime time is Hours 16..22, not the early-morning unlock wave.
+    console = (-0.20, -0.36, -0.52, -0.22, -0.04, 0.00, -0.07, -0.15,
+               -0.18, -0.14, -0.04, 0.10, 0.27, 0.52, 0.68, 0.79,
+               0.86, 0.91, 0.91, 0.85, 0.78, 0.71, 0.61)
+    multi = (-0.10, -0.22, -0.31, -0.34, -0.25, -0.16, -0.13, -0.17,
+             -0.19, -0.15, -0.05, 0.08, 0.24, 0.45, 0.62, 0.74,
+             0.81, 0.84, 0.82, 0.75, 0.65, 0.54, 0.42)
+    surge = (0.28, 0.12, -0.03, -0.17, -0.22, -0.18, -0.12, -0.10,
+             -0.08, -0.02, 0.08, 0.17, 0.28, 0.43, 0.55, 0.62,
+             0.67, 0.65, 0.58, 0.47, 0.35, 0.23, 0.12)
+    early = (-0.30, -0.37, -0.40, -0.37, -0.30, -0.22, -0.18, -0.17,
+             -0.15, -0.10, -0.02, 0.08, 0.18, 0.29, 0.36, 0.39,
+             0.39, 0.35, 0.28, 0.20, 0.10, 0.00, -0.10)
+    late = (-0.05, -0.10, -0.15, -0.25, -0.20, 0.02, 0.30, 0.90,
+            2.10, 3.15, 3.75, 4.15, 4.45, 4.75, 4.95, 5.05,
+            5.10, 5.08, 4.98, 4.82, 4.62, 4.40, 4.15)
     curves = (console, multi, surge, early, late)
+    if features.get("us_dst"):
+        # EDT puts US East midnight at Hour 5, one hour before the EST curve.
+        for curve in (console, multi):
+            shifted = list(curve)
+            for hour in range(4, 11):
+                shifted[hour - 2] = curve[hour - 3]
+            curve = tuple(shifted)
+            if curve is console:
+                console = curve
+            else:
+                multi = curve
+        curves = (console, multi, surge, early, late)
     momentum = 0.11 * finite(features.get("slope_1h")) + 0.08 * finite(features.get("minute_delta"))
     result = []
     for index in range(23):
@@ -301,21 +378,23 @@ def structural_log_ratios(features: dict) -> list[float]:
         # Very large launches grow sublinearly relative to an already large H1.
         value *= 1.0 - 0.17 * scale
         value += momentum * math.exp(-(hour - 2) / 5.0)
+        if features.get("console_only"):
+            value += 0.18 * (1.0 - math.exp(-max(0, hour - 5) / 8.0))
         result.append(value)
     return result
 
 
 def residual_scale(features: dict, hour: int, residual_rms: float = 0.32) -> float:
-    """Conditional log scale, widened by horizon, regime ambiguity and activity."""
+    """Conditional expected log error before empirical OOF rescaling."""
     probs = list(features.get("regimes") or [0.2] * 5)
     ambiguity = 1.0 - max(probs)
     live = 1.0 if finite(features.get("minute_reads")) >= 20 else 0.0
-    scale = residual_rms * (0.90 + (0.007 if features.get("console_only") else 0.011) * (hour - 2))
-    scale *= 1.0 + 0.34 * ambiguity + 0.15 * finite(features.get("early_activity"))
-    scale *= 1.0 + 0.08 * clamp(finite(features.get("minute_cv")) / 0.25, 0.0, 2.0)
-    scale *= 1.0 - 0.06 * live
+    scale = residual_rms * (0.88 + 0.012 * (hour - 2))
+    scale *= 1.0 + 0.38 * ambiguity + 0.18 * finite(features.get("early_activity"))
+    scale *= 1.0 + 0.30 * probs[4] + 0.06 * clamp(finite(features.get("minute_cv")) / 0.25, 0.0, 2.0)
+    scale *= 1.0 - 0.08 * live
     if features.get("console_only"):
-        scale *= 0.64
+        scale *= 0.86
     return clamp(scale, 0.10, 1.35)
 
 
@@ -347,58 +426,43 @@ def _student_t5_quantiles() -> tuple[float, float]:
 
 def calibrate_quantiles(log_medians, features: dict, standardized_residuals=None,
                         base_rms: float = 0.32) -> list[list[float]]:
-    """Convert log medians and honest residuals into smooth asymmetric bands."""
-    records = standardized_residuals or []
-    if records and isinstance(records[0], (tuple, list)):
-        pairs = [(clamp(finite(v), -5.0, 5.0), max(1e-6, finite(w, 1.0)))
-                 for v, w in records]
-    else:
-        pairs = [(clamp(finite(v), -5.0, 5.0), 1.0) for v in records]
-    values = [v for v, _ in pairs]
-    weights = [w for _, w in pairs]
-    if len(values) >= 12:
-        lower = max(0.08, -weighted_quantile(values, weights, 0.25))
-        upper = max(0.08, weighted_quantile(values, weights, 0.75))
-        empirical_center = weighted_quantile(values, weights, 0.5)
-        absolute = [abs(v - empirical_center) for v in values]
-        spread = weighted_quantile(absolute, weights, 0.5) / 0.6744897501960817
-        mean_square = sum(w * (v - empirical_center) ** 2 for v, w in pairs) / max(1e-12, sum(weights))
-        base_rms = clamp(max(spread, math.sqrt(mean_square) * 0.82), 0.22, 1.35)
-    else:
-        lower = upper = 0.6744897501960817
-        empirical_center = 0.0
-    # Heavy tails retain conformal asymmetry without allowing outliers to explode.
-    t25, t95 = _student_t5_quantiles()
-    normal25, normal95 = -NORMAL_Z[1], NORMAL_Z[3]
-    tail_low = 0.58 * normal25 + 0.42 * t25
-    tail_high = 0.58 * normal95 + 0.42 * t95
-    rows = []
+    """Rescale per-hour standardized OOF distributions to the target case."""
+    records = standardized_residuals if isinstance(standardized_residuals, dict) else {}
     h1 = max(1.0, finite(features.get("h1"), 1.0))
-    mega = clamp((math.log(h1) - math.log(250000.0)) / 2.0, 0.0, 1.0)
+    mega = clamp((math.log(h1) - math.log(100000.0)) /
+                 (math.log(5000000.0) - math.log(100000.0)), 0.0, 1.0)
+    large_damping = 1.0 - 0.23 * mega
+    if features.get("console_only"):
+        large_damping *= 0.66
+    rows = []
     for index, median in enumerate(log_medians):
         hour = index + 2
-        sigma = residual_scale(features, hour, base_rms)
-        inner_ratio = clamp(lower / max(0.08, base_rms), 0.28, 2.5)
-        inner_ratio_high = clamp(upper / max(0.08, base_rms), 0.28, 2.5)
-        finite_sample = 1.08 + 0.6 / math.sqrt(max(4.0, len(values) / 23.0))
-        low_semi = sigma
-        high_semi = sigma
-        high_semi *= 1.0 - 0.12 * mega * math.exp(-(hour - 2) / 10.0)
-        offsets = (-tail_high * low_semi * finite_sample,
-                   -tail_low * low_semi * inner_ratio,
-                   0.0,
-                   tail_low * high_semi * inner_ratio_high,
-                   tail_high * high_semi * finite_sample * (1.0 - 0.08 * mega))
-        center = median + sigma * clamp(empirical_center * 0.12, -0.08, 0.08)
-        values = [h1 * math.exp(clamp(center + off, -20.0, 20.0)) for off in offsets]
+        local = list(records.get(hour, []))
+        # Adjacent-hour shrinkage stabilizes tails without recreating a pooled
+        # all-hours distribution. The current hour retains most of the weight.
+        for neighbour, factor in ((hour - 1, 0.32), (hour + 1, 0.32)):
+            local.extend((value, weight * factor) for value, weight in records.get(neighbour, []))
+        sigma = residual_scale(features, hour, base_rms) * large_damping
+        sigma *= 1.0 + 0.30 * finite(features.get("regimes", [0.2] * 5)[4])
+        if local:
+            values = [clamp(value, -4.0, 4.0) for value, _ in local]
+            weights = [weight for _, weight in local]
+            center = weighted_quantile(values, weights, 0.5)
+            deviations = [value - 0.35 * center for value in values]
+            empirical = [weighted_quantile(deviations, weights, level) for level in LEVELS]
+            parametric = [z * 0.88 for z in NORMAL_Z]
+            offsets = [0.72 * e + 0.28 * p for e, p in zip(empirical, parametric)]
+        else:
+            offsets = [z * 0.92 for z in NORMAL_Z]
+        offsets = [offset * sigma * 1.18 for offset in offsets]
+        values = [h1 * math.exp(clamp(median + offset, -20.0, 20.0)) for offset in offsets]
         rows.append(values)
-    # Adjacent-hour smoothing reduces unstable conformal band artifacts.
     smoothed = [row[:] for row in rows]
     for i in range(1, len(rows) - 1):
         for q in (0, 1, 3, 4):
             center = math.log(max(MIN_VALUE, rows[i][q]))
             neighbours = math.log(max(MIN_VALUE, rows[i - 1][q])) + math.log(max(MIN_VALUE, rows[i + 1][q]))
-            smoothed[i][q] = math.exp(0.84 * center + 0.08 * neighbours)
+            smoothed[i][q] = math.exp(0.90 * center + 0.05 * neighbours)
     return format_quantiles(smoothed)
 
 

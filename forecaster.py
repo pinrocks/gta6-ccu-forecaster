@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import math
-from datetime import timedelta
 
 from calibration import (
     HOURS, aligned_value, baseline, calibrate_quantiles, clamp,
-    dst_alignment_hours, extract_features, feature_vector, finite,
-    parse_time, structural_log_ratios, weighted_quantile,
+    dst_alignment_hours, extract_features, fast_hour, feature_vector, finite,
+    parse_time, residual_scale, structural_log_ratios, weighted_quantile,
 )
 
 
@@ -16,39 +15,42 @@ RIDGE_PENALTY = 5.0
 HUBER_DELTA = 0.75
 
 
-def _release_rows(comparable: dict):
-    day = parse_time(comparable.get("day_start"))
-    if day is None:
-        return {}
-    rows = {}
-    for row in comparable.get("hourly") or []:
+def _scan_comparable(comparable: dict):
+    """One pass: release-day rows and the bounded pre-checkpoint feature history."""
+    day_start = comparable.get("day_start")
+    day_text = day_start[:10] if isinstance(day_start, str) else ""
+    rows, history, hourly = {}, [], []
+    checkpoint_prefix = day_text + "T00"
+    source = comparable.get("hourly") or []
+    # Complete SullyGnome windows place Hour 1 after 14 daily rows. Use the
+    # timestamped release-day suffix directly; irregular inputs take the scan.
+    start = 336 if len(source) > 336 and isinstance(source[336], dict) and str(source[336].get("from", "")).startswith(day_text + "T00") else None
+    if start is None:
+        start = next((i for i, row in enumerate(source)
+                      if isinstance(row, dict) and str(row.get("from", "")).startswith(day_text + "T00")), None)
+    recent_start = max(0, (start if start is not None else len(source)) - 96)
+    for row in source[recent_start:]:
         if not isinstance(row, dict):
             continue
-        at = parse_time(row.get("from"))
-        if at is None:
-            continue
-        offset = int(round((at - day).total_seconds() / 3600.0)) + 1
-        if 1 <= offset <= 24 and abs((at - day).total_seconds() / 3600.0 - (offset - 1)) < 0.01:
-            rows[offset] = row
-    return rows
+        stamp = row.get("from")
+        hour = fast_hour(stamp, day_text)
+        if hour is not None:
+            rows[hour] = row
+        if isinstance(stamp, str) and stamp[:13] <= checkpoint_prefix:
+            history.append(row)
+            hourly.append(row)
+    # Comparable features use only the recent checkpoint window, not all 14 days.
+    return rows, history[-96:], hourly[-96:]
+
+
+def _release_rows(comparable: dict):
+    return _scan_comparable(comparable)[0]
 
 
 def _pseudo_case(comparable: dict, rows: dict) -> dict:
-    day = parse_time(comparable.get("day_start"))
+    _, history, hourly = _scan_comparable(comparable)
     h1 = rows[1]
-    history = []
-    hourly = []
-    h1at = parse_time(h1.get("from"))
-    checkpoint = (h1at + timedelta(hours=1)).isoformat() if h1at else None
-    for row in comparable.get("hourly") or []:
-        at = parse_time(row.get("from")) if isinstance(row, dict) else None
-        h1at = parse_time(h1.get("from"))
-        if at is None or h1at is None or at > h1at:
-            continue
-        history.append({"at": row.get("from"), "viewers": row.get("viewers"),
-                        "channels": row.get("channels")})
-        hourly.append({"from": row.get("from"), "viewers": row.get("viewers"),
-                       "channels": row.get("channels"), "reads": 1})
+    checkpoint = h1.get("from", "")[:13] + ":59:59Z"
     return {
         "id": "comparable", "day_start": comparable.get("day_start"),
         "checkpoint": checkpoint, "known": [dict(h1, hour=1)],
@@ -66,13 +68,20 @@ def prepare_comparables(case: dict) -> list[dict]:
         unlock = str(comparable.get("unlock") or "")
         if "target-history" in unlock or "not a launch" in unlock.lower():
             continue
-        rows = _release_rows(comparable)
+        rows, history, hourly = _scan_comparable(comparable)
         if 1 not in rows or sum(h in rows for h in HOURS) < 12:
             continue
         h1 = max(1.0, finite(rows[1].get("viewers"), 1.0))
         if finite(rows[1].get("viewers"), 0.0) <= 0:
             continue
-        pseudo = _pseudo_case(comparable, rows)
+        pseudo = {
+            "day_start": comparable.get("day_start"),
+            "checkpoint": rows[1].get("from", "")[:13] + ":59:59Z",
+            "known": [dict(rows[1], hour=1)], "history": history,
+            "history_hourly": hourly, "streams": None,
+            "platforms": comparable.get("platforms"), "unlock": unlock,
+            "game": {"twitch_id": ""},
+        }
         features = extract_features(pseudo)
         ratios = {h: math.log(max(1.0, finite(rows[h].get("viewers"), 1.0)) / h1)
                   for h in HOURS if h in rows}
@@ -84,6 +93,21 @@ def prepare_comparables(case: dict) -> list[dict]:
             "platforms": comparable.get("platforms", ""), "h1": h1,
         })
     return prepared
+
+
+def _regression_vector(x):
+    # Regime probabilities sum to one; dropping one avoids a singular dummy
+    # block. Early-access activity is already represented by its regime mass.
+    return x[:8] + x[9:18]
+
+
+def _regime_weight(target_features, candidate_features):
+    target_live = finite(target_features.get("live_at_h1"), 0.0)
+    target_late = finite((target_features.get("regimes") or [0.2] * 5)[4])
+    candidate_late = finite((candidate_features.get("regimes") or [0.2] * 5)[4])
+    downweight = target_live * candidate_late
+    mismatch = abs(target_late - candidate_late)
+    return clamp((1.0 - 0.94 * downweight) * math.exp(-1.8 * mismatch), 0.025, 1.0)
 
 
 def _matvec(matrix, vector):
@@ -113,10 +137,30 @@ def _solve(matrix, vector):
     return [augmented[i][-1] for i in range(n)]
 
 
-def _weighted_fit(xs, ys, weights, penalty=RIDGE_PENALTY):
-    if not xs:
-        return [0.0], [], [0.0]
-    n, p = len(xs), len(xs[0])
+def _inverse(matrix):
+    """One Gauss-Jordan elimination with all identity right-hand sides."""
+    n = len(matrix)
+    work = [[matrix[i][j] + (1e-10 if i == j else 0.0) for j in range(n)] +
+            [1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    for column in range(n):
+        pivot = max(range(column, n), key=lambda row: abs(work[row][column]))
+        work[column], work[pivot] = work[pivot], work[column]
+        scale = work[column][column]
+        if abs(scale) < 1e-15:
+            work[column][column] += 1e-9
+            scale = work[column][column]
+        work[column] = [value / scale for value in work[column]]
+        for row in range(n):
+            if row == column:
+                continue
+            factor = work[row][column]
+            if factor:
+                work[row] = [a - factor * b for a, b in zip(work[row], work[column])]
+    return [row[n:] for row in work]
+
+
+def _prepare_design(xs, weights):
+    p = len(xs[0])
     means = [0.0] * p
     scales = [1.0] * p
     total_weight = sum(weights) or 1.0
@@ -125,64 +169,58 @@ def _weighted_fit(xs, ys, weights, penalty=RIDGE_PENALTY):
         variance = sum(w * (x[j] - means[j]) ** 2 for x, w in zip(xs, weights)) / total_weight
         scales[j] = max(0.12, math.sqrt(variance))
     standardized = [[1.0] + [(x[j] - means[j]) / scales[j] for j in range(1, p)] for x in xs]
+    outer_products = [[[x[j] * x[k] for k in range(j, p)] for j in range(p)] for x in standardized]
+    return standardized, outer_products, means, scales
+
+
+def _weighted_fit(xs, ys, weights, penalty=RIDGE_PENALTY, prepared=None):
+    if not xs:
+        return [0.0], []
+    if prepared is None:
+        prepared = _prepare_design(xs, weights)
+    standardized, outer_products, means, scales = prepared
+    p = len(standardized[0])
     coefficients = [0.0] * p
-    for _ in range(7):
+    robust_weights = weights[:]
+    for iteration in range(2):
         normal = [[0.0] * p for _ in range(p)]
         rhs = [0.0] * p
         robust_weights = []
-        for x, y, weight in zip(standardized, ys, weights):
+        needs_robust = False
+        for x, y, weight, outer in zip(standardized, ys, weights, outer_products):
             residual = y - sum(a * b for a, b in zip(x, coefficients))
             huber = min(1.0, HUBER_DELTA / max(HUBER_DELTA, abs(residual)))
+            needs_robust = needs_robust or huber < 1.0
             w = max(1e-6, weight * huber)
             robust_weights.append(w)
             for j in range(p):
                 rhs[j] += w * x[j] * y
                 for k in range(j, p):
-                    normal[j][k] += w * x[j] * x[k]
+                    normal[j][k] += w * outer[j][k - j]
         for j in range(p):
             for k in range(j):
                 normal[j][k] = normal[k][j]
-            if j:
-                normal[j][j] += penalty
-            else:
-                normal[j][j] += 1e-8
+            normal[j][j] += penalty if j else 1e-8
         updated = _solve(normal, rhs)
         if max(abs(a - b) for a, b in zip(updated, coefficients)) < 1e-7:
             coefficients = updated
             break
         coefficients = updated
-    # Unstandardize so the same coefficient vector accepts raw feature vectors.
+        if iteration == 0 and not needs_robust:
+            break
+    inverse = _inverse(normal)
     raw = [0.0] * p
     for j in range(1, p):
         raw[j] = coefficients[j] / scales[j]
         raw[0] -= coefficients[j] * means[j] / scales[j]
     raw[0] += coefficients[0]
-    return raw, means, scales
-
-
-def _press_residuals(xs, ys, weights, coefficients, penalty=RIDGE_PENALTY):
-    """Ridge PRESS residuals; solve once with all RHS, not once per row."""
-    if len(xs) < 3:
-        return [y - sum(a * b for a, b in zip(x, coefficients)) for x, y in zip(xs, ys)]
-    p = len(xs[0])
-    normal = [[0.0] * p for _ in range(p)]
-    for x, weight in zip(xs, weights):
-        for j in range(p):
-            for k in range(j, p):
-                normal[j][k] += weight * x[j] * x[k]
-    for j in range(p):
-        for k in range(j):
-            normal[j][k] = normal[k][j]
-        normal[j][j] += penalty if j else 1e-8
-    inverse = [_solve(normal, [1.0 if j == k else 0.0 for k in range(p)])
-               for j in range(p)]
-    residuals = []
-    for x, y in zip(xs, ys):
-        leverage = weight * sum(x[j] * inverse[j][k] * x[k]
-                                for j in range(p) for k in range(p))
+    press = []
+    for x, y, weight in zip(standardized, ys, robust_weights):
+        inverse_x = [sum(inverse[j][k] * x[j] for j in range(p)) for k in range(p)]
+        leverage = weight * sum(a * b for a, b in zip(x, inverse_x))
         residual = y - sum(a * b for a, b in zip(x, coefficients))
-        residuals.append(residual / max(0.25, 1.0 - leverage))
-    return residuals
+        press.append(residual / max(0.25, 1.0 - leverage))
+    return raw, press
 
 
 def _similarity(target_x, candidate_x, candidate, target_features):
@@ -196,15 +234,21 @@ def _similarity(target_x, candidate_x, candidate, target_features):
         squared *= 0.72
     distance = math.sqrt(squared / sum(feature_weights))
     early_penalty = 0.45 if candidate["features"].get("early_activity", 0.0) > 0.35 else 1.0
-    return math.exp(-1.35 * distance * distance) * early_penalty + 0.012
+    return (math.exp(-1.35 * distance * distance) * early_penalty + 0.006) * _regime_weight(target_features, candidate["features"])
 
 
-def _similarity_curves(target_features, target_x, comparables, target_day):
+def _similarity_curves(target_features, target_x, comparables, target_day, fast=False):
     weights = [_similarity(target_x, c["x"], c, target_features) for c in comparables]
+    target_unlock = finite(target_features.get("us_unlock_utc"), 5.0)
     aligned = []
     for c in comparables:
-        shift = int(dst_alignment_hours(c["day_start"], target_day))
-        aligned.append({h: aligned_value(c["ratios"], h, shift) for h in HOURS})
+        shift = int(clamp(target_unlock - finite(c["features"].get("us_unlock_utc"), 5.0), -1, 1))
+        cache_key = "aligned_edt" if target_unlock == 4 else "aligned_est"
+        curve = c.get(cache_key)
+        if curve is None:
+            curve = {h: aligned_value(c["ratios"], h, shift) for h in HOURS}
+            c[cache_key] = curve
+        aligned.append(curve)
     curves = []
     scale = math.tanh((target_features["log_h1"] - 10.5) / 3.0)
     momentum = 0.06 * finite(target_features.get("slope_1h")) + 0.08 * finite(target_features.get("minute_delta"))
@@ -214,10 +258,10 @@ def _similarity_curves(target_features, target_x, comparables, target_day):
             curves.append(0.0)
             continue
         values, local_weights = zip(*pairs)
-        median = weighted_quantile(values, local_weights, 0.5)
         total = sum(local_weights)
-        mean = sum(v * w for v, w in pairs) / total if total else median
-        value = 0.62 * median + 0.38 * mean
+        mean = sum(v * w for v, w in pairs) / total if total else 0.0
+        median = mean if fast else weighted_quantile(values, local_weights, 0.5)
+        value = mean if fast else 0.62 * median + 0.38 * mean
         value *= 1.0 - 0.10 * scale
         # Rolling launches commonly dip just before the North American wave.
         if target_features.get("console_only") and h in (3, 4, 5):
@@ -227,25 +271,37 @@ def _similarity_curves(target_features, target_x, comparables, target_day):
     return curves
 
 
-def _ridge_models(train):
+def _ridge_models(train, target_features=None):
     models = {}
+    design_cache = {}
     for hour in HOURS:
         usable = [c for c in train if hour in c["ratios"]]
         if len(usable) < 5:
             models[hour] = None
             continue
-        xs = [c["x"] for c in usable]
+        key = tuple(id(c) for c in usable)
+        cached = design_cache.get(key)
+        if cached is None:
+            xs = [_regression_vector(c["x"]) for c in usable]
+            weights = [(0.75 + 0.25 / (1.0 + abs(c["features"]["log_h1"] - 10.5) / 5.0))
+                       * (_regime_weight(target_features, c["features"]) if target_features else 1.0)
+                       for c in usable]
+            cached = (xs, weights, _prepare_design(xs, weights))
+            design_cache[key] = cached
+        xs, weights, prepared = cached
         ys = [c["ratios"][hour] for c in usable]
-        weights = [0.75 + 0.25 / (1.0 + abs(c["features"]["log_h1"] - 10.5) / 5.0)
-                   for c in usable]
-        coefficients, _, _ = _weighted_fit(xs, ys, weights)
-        press = _press_residuals(xs, ys, weights, coefficients)
+        coefficients, press = _weighted_fit(xs, ys, weights, prepared=prepared)
         center = weighted_quantile(ys, weights, 0.5)
         models[hour] = (usable, coefficients, press, center)
     return models
 
 
 def _blend(ridge, similar, structural, train_size, features):
+    late = finite(features.get("regimes", [0.2] * 5)[4])
+    if late > 0.35:
+        # Global-growth curves are structurally different from ordinary rolling
+        # launches; contaminated analogues must not dominate their median.
+        return 0.18 * ridge + 0.12 * similar + 0.70 * structural
     if ridge is None:
         ridge, wr = similar, 0.0
     else:
@@ -253,7 +309,7 @@ def _blend(ridge, similar, structural, train_size, features):
     ws = 0.37 if train_size else 0.0
     wp = max(0.12, 1.0 - wr - ws)
     if max(features.get("regimes") or [0.2]) > 0.65:
-        wp += 0.10
+        wp += 0.20 if features.get("console_only") else 0.10
         ws = max(0.18, ws - 0.06)
         wr = max(0.0, wr - 0.04)
     return (wr * ridge + ws * similar + wp * structural) / (wr + ws + wp)
@@ -270,58 +326,65 @@ def _ensemble_predict(train, target_features, target_x, target_day, models=None)
             ridge = None
         else:
             _, coefficients, _, center = model
-            raw = sum(a * b for a, b in zip(coefficients, target_x))
+            raw = sum(a * b for a, b in zip(coefficients, _regression_vector(target_x)))
             ridge = clamp(raw, center - 2.2, center + 2.2)
         result.append(_blend(ridge, similar[index], structural[index], len(train), target_features))
     return result
 
 
 def _oof_standardized_residuals(comparables, models=None, target_features=None):
+    """Per-hour OOF residuals standardized by each held-out launch's sigma."""
+    records = {hour: [] for hour in HOURS}
     if len(comparables) < 7:
-        return []
-    models = _ridge_models(comparables) if models is None else models
-    target_log_h1 = finite((target_features or {}).get("log_h1"), 10.5)
+        return records
     target_regimes = (target_features or {}).get("regimes") or [0.2] * 5
-    records = []
+    target_log_h1 = finite((target_features or {}).get("log_h1"), 10.5)
+    models = models or _ridge_models(comparables, target_features)
+    positions = {hour: {id(c): i for i, c in enumerate(model[0])}
+                 for hour, model in models.items() if model is not None}
     for held_index, held in enumerate(comparables):
         train = comparables[:held_index] + comparables[held_index + 1:]
         structural = structural_log_ratios(held["features"])
-        similar = _similarity_curves(held["features"], held["x"], train, held["day_start"])
-        # Tiny pre-launch H1 values are intrinsically explosive for late global
-        # unlocks. A bounded scale correction removes that systematic asymmetry.
-        low_scale = clamp((8.0 - held["features"]["log_h1"]) / 4.0, 0.0, 1.0)
-        correction = low_scale * (0.35 + 5.2 * held["features"]["regimes"][4])
+        similar = _similarity_curves(held["features"], held["x"], train, held["day_start"], fast=True)
+        regime_similarity = sum(a * b for a, b in zip(target_regimes, held["features"]["regimes"]))
+        scale_distance = abs(target_log_h1 - held["features"]["log_h1"])
+        weight = (0.05 + regime_similarity) * math.exp(-0.16 * scale_distance)
         for index, hour in enumerate(HOURS):
             actual = held["ratios"].get(hour)
             model = models[hour]
             if actual is None or model is None:
                 continue
             usable, coefficients, press, center = model
-            try:
-                position = usable.index(held)
-            except ValueError:
+            position = positions[hour].get(id(held), -1)
+            if position < 0:
                 continue
-            fitted = sum(a * b for a, b in zip(coefficients, held["x"]))
+            fitted = sum(a * b for a, b in zip(coefficients, _regression_vector(held["x"])))
             ridge = clamp(fitted + press[position], center - 2.2, center + 2.2)
             prediction = _blend(ridge, similar[index], structural[index], len(train), held["features"])
-            prediction += correction * (0.55 + 0.45 * math.exp(-(hour - 2) / 12.0))
-            regime_similarity = sum(a * b for a, b in zip(target_regimes, held["features"]["regimes"]))
-            scale_distance = abs(target_log_h1 - held["features"]["log_h1"])
-            weight = (0.08 + regime_similarity) * math.exp(-0.10 * scale_distance)
-            records.append((clamp(actual - prediction, -5.0, 5.0), weight))
+            sigma = residual_scale(held["features"], hour, 0.34)
+            standardized = clamp((actual - prediction) / sigma, -4.0, 4.0)
+            records[hour].append((standardized, weight))
     return records
 
 
 def _apply_oof_center(log_ratios, features, residual_records):
-    if not residual_records:
+    if features.get("console_only") and finite(features.get("h1")) < 250000.0:
         return log_ratios
-    values = [record[0] for record in residual_records]
-    weights = [record[1] for record in residual_records]
-    center = weighted_quantile(values, weights, 0.5)
-    # Partial pooling avoids turning noisy median residuals into overcorrection.
-    adjustment = clamp(center * 0.55, -0.32, 1.8)
-    return [value + adjustment * (0.75 + 0.25 * index / 22.0)
-            for index, value in enumerate(log_ratios)]
+    adjusted = []
+    for index, value in enumerate(log_ratios):
+        records = residual_records.get(index + 2, []) if residual_records else []
+        if records:
+            values = [record[0] for record in records]
+            weights = [record[1] for record in records]
+            center = weighted_quantile(values, weights, 0.5)
+            sigma = residual_scale(features, index + 2, 0.34)
+            late = finite(features.get("regimes", [0.2] * 5)[4])
+            strength = 0.78 + 0.16 * late
+            adjustment = clamp(center * sigma * strength, -0.55, 0.75 + 2.2 * late)
+        else:
+            adjustment = 0.0
+        adjusted.append(value + adjustment)
+    return adjusted
 
 
 def predict_prepared(comparables, features, day_start):
@@ -329,12 +392,8 @@ def predict_prepared(comparables, features, day_start):
     if not comparables:
         return calibrate_quantiles(structural_log_ratios(features), features, [], 0.38)
     x = feature_vector(features)
-    models = _ridge_models(comparables)
+    models = _ridge_models(comparables, features)
     log_ratios = _ensemble_predict(comparables, features, x, day_start, models)
-    low_scale = clamp((8.0 - features["log_h1"]) / 4.0, 0.0, 1.0)
-    correction = low_scale * (0.35 + 5.2 * features["regimes"][4])
-    log_ratios = [value + correction * (0.55 + 0.45 * math.exp(-(hour - 2) / 12.0))
-                  for value, hour in zip(log_ratios, HOURS)]
     residuals = _oof_standardized_residuals(comparables, models, features)
     log_ratios = _apply_oof_center(log_ratios, features, residuals)
     return calibrate_quantiles(log_ratios, features, residuals, 0.34)
